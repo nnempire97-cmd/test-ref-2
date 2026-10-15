@@ -1,11 +1,17 @@
 """
 Реферальный Telegram-бот: 3 ⭐ за каждого приглашённого друга.
+Версия 2: каналы ОП настраиваются командами в боте.
 
-Установка:  pip install aiogram aiosqlite
-Запуск:     BOT_TOKEN=xxx ADMIN_ID=123456 CHANNEL=@tour6767 python referral_bot.py
+Переменные в Railway:
+  BOT_TOKEN  - токен от @BotFather
+  ADMIN_ID   - твой Telegram ID
+  CHANNEL    - (необязательно) первый канал ОП при самом первом запуске, например @tour6767
+  DB_PATH    - /data/bot.db (нужен Volume с путём /data)
+  BTN_TEXT   - (необязательно) текст кнопки в меню, например 📢 Наш канал
+  BTN_URL    - (необязательно) ссылка кнопки; пусто = кнопки нет
 
-Бот должен быть админом в канале CHANNEL (нужно для проверки подписки).
-Если проверка подписки не нужна — CHANNEL="" (пусто).
+Команды админа:
+  /admin  /addop @канал  /delop @канал  /listop  /broadcast текст
 """
 import asyncio
 import os
@@ -24,7 +30,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL = os.getenv("CHANNEL", "@tour6767")  # "" = без проверки подписки
+CHANNEL = os.getenv("CHANNEL", "")
+BTN_TEXT = os.getenv("BTN_TEXT", "")
+BTN_URL = os.getenv("BTN_URL", "")
 REWARD = 3          # звёзд за приглашённого
 MIN_WITHDRAW = 15   # минимум для вывода
 DB = os.getenv("DB_PATH", "bot.db")
@@ -35,6 +43,7 @@ log = logging.getLogger("refbot")
 
 # ───────────────────────── БАЗА ─────────────────────────
 async def init_db():
+    os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
     async with aiosqlite.connect(DB) as db:
         await db.executescript(
             """
@@ -54,8 +63,17 @@ async def init_db():
                 status TEXT DEFAULT 'pending',
                 created TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS channels(username TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             """
         )
+        # при самом первом запуске кладём CHANNEL в ОП (один раз)
+        cur = await db.execute("SELECT 1 FROM meta WHERE key='seeded'")
+        if not await cur.fetchone():
+            if CHANNEL:
+                ch = CHANNEL if CHANNEL.startswith("@") else "@" + CHANNEL
+                await db.execute("INSERT OR IGNORE INTO channels VALUES(?)", (ch,))
+            await db.execute("INSERT INTO meta VALUES('seeded','1')")
         await db.commit()
 
 
@@ -98,8 +116,11 @@ def main_kb() -> InlineKeyboardMarkup:
     b.button(text="🏆 Топ", callback_data="top")
     b.button(text="💸 Вывести ⭐", callback_data="withdraw")
     b.button(text="ℹ️ Как это работает", callback_data="help")
-    b.button(text="📢 Турниры Brawl Stars", url=f"https://t.me/{CHANNEL.lstrip('@')}" if CHANNEL else "https://t.me/tour6767")
-    b.adjust(2, 2, 2, 1)
+    if BTN_URL:
+        b.button(text=BTN_TEXT or "📢 Наш канал", url=BTN_URL)
+        b.adjust(2, 2, 2, 1)
+    else:
+        b.adjust(2, 2, 2)
     return b.as_markup()
 
 
@@ -109,37 +130,50 @@ def back_kb() -> InlineKeyboardMarkup:
     )
 
 
-def sub_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
-            [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")],
-        ]
-    )
+def sub_kb(missing: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"📢 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
+        for ch in missing
+    ]
+    rows.append([InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ───────────────────────── ЛОГИКА ─────────────────────────
-async def is_subscribed(bot: Bot, uid: int) -> bool:
-    if not CHANNEL:
-        return True
-    try:
-        m = await bot.get_chat_member(CHANNEL, uid)
-        return m.status in ("member", "administrator", "creator")
-    except Exception as e:
-        log.warning("sub check failed: %s", e)
-        return False
+async def get_channels() -> list:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT username FROM channels")
+        return [r[0] for r in await cur.fetchall()]
+
+
+async def not_subscribed(bot: Bot, uid: int) -> list:
+    """Список каналов ОП, на которые пользователь ещё не подписан."""
+    missing = []
+    for ch in await get_channels():
+        try:
+            m = await bot.get_chat_member(ch, uid)
+            if m.status not in ("member", "administrator", "creator"):
+                missing.append(ch)
+        except Exception as e:
+            # бот не админ в канале или канал не найден: людей не блокируем
+            log.warning("ОП %s не проверить: %s", ch, e)
+    return missing
 
 
 async def try_reward(bot: Bot, uid: int):
-    """Начисляем 3 ⭐ пригласившему, один раз, после прохождения подписки."""
+    """Начисляем 3 ⭐ пригласившему, один раз, после прохождения ОП."""
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT referrer_id, rewarded, first_name FROM users WHERE id=?", (uid,))
+        cur = await db.execute(
+            "SELECT referrer_id, rewarded, first_name FROM users WHERE id=?", (uid,)
+        )
         u = await cur.fetchone()
         if not u or not u["referrer_id"] or u["rewarded"]:
             return
         await db.execute("UPDATE users SET rewarded=1 WHERE id=?", (uid,))
-        await db.execute("UPDATE users SET balance=balance+? WHERE id=?", (REWARD, u["referrer_id"]))
+        await db.execute(
+            "UPDATE users SET balance=balance+? WHERE id=?", (REWARD, u["referrer_id"])
+        )
         await db.commit()
     try:
         await bot.send_message(
@@ -151,7 +185,7 @@ async def try_reward(bot: Bot, uid: int):
         pass
 
 
-async def send_menu(target: Message, uid: int, edit=False):
+async def send_menu(target: Message, edit=False):
     text = (
         "👋 <b>Добро пожаловать!</b>\n\n"
         f"Приглашай друзей и получай <b>{REWARD} ⭐</b> за каждого.\n"
@@ -174,29 +208,35 @@ async def start(m: Message, command: CommandObject, bot: Bot):
             ref = r
     await add_user(uid, m.from_user.username, m.from_user.first_name, ref)
 
-    if not await is_subscribed(bot, uid):
+    missing = await not_subscribed(bot, uid)
+    if missing:
         await m.answer(
-            "Чтобы пользоваться ботом, подпишись на канал с турнирами 👇",
-            reply_markup=sub_kb(),
+            "Подпишись на каналы, чтобы пользоваться ботом 👇",
+            reply_markup=sub_kb(missing),
         )
         return
     await try_reward(bot, uid)
-    await send_menu(m, uid)
+    await send_menu(m)
 
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(c: CallbackQuery, bot: Bot):
-    if not await is_subscribed(bot, c.from_user.id):
-        await c.answer("Ты ещё не подписан ❌", show_alert=True)
+    missing = await not_subscribed(bot, c.from_user.id)
+    if missing:
+        try:
+            await c.message.edit_reply_markup(reply_markup=sub_kb(missing))
+        except Exception:
+            pass
+        await c.answer("Подписался не на все ❌", show_alert=True)
         return
     await try_reward(bot, c.from_user.id)
     await c.answer("Подписка подтверждена ✅")
-    await send_menu(c.message, c.from_user.id, edit=True)
+    await send_menu(c.message, edit=True)
 
 
 @router.callback_query(F.data == "menu")
 async def menu(c: CallbackQuery):
-    await send_menu(c.message, c.from_user.id, edit=True)
+    await send_menu(c.message, edit=True)
     await c.answer()
 
 
@@ -222,7 +262,7 @@ async def link(c: CallbackQuery, bot: Bot):
     url = f"https://t.me/{me.username}?start={c.from_user.id}"
     share = (
         "https://t.me/share/url?url=" + url +
-        "&text=Заходи%20в%20бота%20—%20бесплатные%20турниры%20Brawl%20Stars%20и%20звёзды%20⭐"
+        "&text=Заходи%20в%20бота%20и%20получай%20звёзды%20⭐"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -232,7 +272,7 @@ async def link(c: CallbackQuery, bot: Bot):
     )
     await c.message.edit_text(
         f"🔗 <b>Твоя реферальная ссылка:</b>\n\n<code>{url}</code>\n\n"
-        f"За каждого друга, который запустит бота и подпишется на канал, "
+        f"За каждого друга, который запустит бота и подпишется на каналы, "
         f"ты получишь <b>{REWARD} ⭐</b>.",
         reply_markup=kb,
         parse_mode="HTML",
@@ -252,8 +292,10 @@ async def refs(c: CallbackQuery):
         text = "У тебя пока нет рефералов. Забери ссылку в «🔗 Моя ссылка» и поделись!"
     else:
         lines = [f"{'✅' if r[1] else '⏳'} {r[0]}" for r in rows]
-        text = "👥 <b>Твои рефералы</b> (последние 15)\n\n" + "\n".join(lines) + \
-               "\n\n✅ — начислено, ⏳ — ещё не подписался"
+        text = (
+            "👥 <b>Твои рефералы</b> (последние 15)\n\n" + "\n".join(lines)
+            + "\n\n✅ — начислено, ⏳ — ещё не подписался"
+        )
     await c.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
     await c.answer()
 
@@ -273,7 +315,9 @@ async def top(c: CallbackQuery):
     else:
         body = "Пока пусто. Стань первым!"
     await c.message.edit_text(
-        f"🏆 <b>Топ-10 по приглашениям</b>\n\n{body}", reply_markup=back_kb(), parse_mode="HTML"
+        f"🏆 <b>Топ-10 по приглашениям</b>\n\n{body}",
+        reply_markup=back_kb(),
+        parse_mode="HTML",
     )
     await c.answer()
 
@@ -283,7 +327,7 @@ async def help_(c: CallbackQuery):
     await c.message.edit_text(
         "ℹ️ <b>Как это работает</b>\n\n"
         "1️⃣ Открой «🔗 Моя ссылка» и отправь её друзьям\n"
-        "2️⃣ Друг запускает бота и подписывается на канал\n"
+        "2️⃣ Друг запускает бота и подписывается на каналы\n"
         f"3️⃣ Тебе падает <b>{REWARD} ⭐</b>\n"
         f"4️⃣ От {MIN_WITHDRAW} ⭐ можно подать заявку на вывод\n\n"
         "⚠️ Накрутка и самоприглашения не засчитываются.",
@@ -300,10 +344,15 @@ async def withdraw(c: CallbackQuery, bot: Bot):
         cur = await db.execute("SELECT balance FROM users WHERE id=?", (uid,))
         bal = (await cur.fetchone())[0]
         if bal < MIN_WITHDRAW:
-            await c.answer(f"Минимум для вывода — {MIN_WITHDRAW} ⭐. Сейчас у тебя {bal}.", show_alert=True)
+            await c.answer(
+                f"Минимум для вывода — {MIN_WITHDRAW} ⭐. Сейчас у тебя {bal}.",
+                show_alert=True,
+            )
             return
         await db.execute("UPDATE users SET balance=0 WHERE id=?", (uid,))
-        cur = await db.execute("INSERT INTO withdrawals(user_id, amount) VALUES(?,?)", (uid, bal))
+        cur = await db.execute(
+            "INSERT INTO withdrawals(user_id, amount) VALUES(?,?)", (uid, bal)
+        )
         wid = cur.lastrowid
         await db.commit()
 
@@ -338,7 +387,9 @@ async def wd_decide(c: CallbackQuery, bot: Bot):
     wid = int(wid)
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM withdrawals WHERE id=? AND status='pending'", (wid,))
+        cur = await db.execute(
+            "SELECT * FROM withdrawals WHERE id=? AND status='pending'", (wid,)
+        )
         w = await cur.fetchone()
         if not w:
             await c.answer("Уже обработана")
@@ -348,10 +399,15 @@ async def wd_decide(c: CallbackQuery, bot: Bot):
             msg = f"💸 Заявка #{wid} выплачена: {w['amount']} ⭐. Спасибо, что с нами!"
         else:
             await db.execute("UPDATE withdrawals SET status='rejected' WHERE id=?", (wid,))
-            await db.execute("UPDATE users SET balance=balance+? WHERE id=?", (w["amount"], w["user_id"]))
+            await db.execute(
+                "UPDATE users SET balance=balance+? WHERE id=?", (w["amount"], w["user_id"])
+            )
             msg = f"❌ Заявка #{wid} отклонена, {w['amount']} ⭐ вернули на баланс."
         await db.commit()
-    await c.message.edit_text(c.message.html_text + f"\n\n→ {'ВЫПЛАЧЕНО' if action == 'wd_ok' else 'ОТКЛОНЕНО'}", parse_mode="HTML")
+    await c.message.edit_text(
+        c.message.html_text + f"\n\n→ {'ВЫПЛАЧЕНО' if action == 'wd_ok' else 'ОТКЛОНЕНО'}",
+        parse_mode="HTML",
+    )
     try:
         await bot.send_message(w["user_id"], msg)
     except Exception:
@@ -360,6 +416,11 @@ async def wd_decide(c: CallbackQuery, bot: Bot):
 
 
 # ───────────────────────── АДМИНКА ─────────────────────────
+def norm_channel(raw: str) -> str:
+    ch = raw.strip().replace("https://t.me/", "")
+    return ch if ch.startswith("@") else "@" + ch
+
+
 @router.message(Command("admin"))
 async def admin(m: Message):
     if m.from_user.id != ADMIN_ID:
@@ -369,15 +430,69 @@ async def admin(m: Message):
         refd = (await (await db.execute("SELECT COUNT(*) FROM users WHERE rewarded=1")).fetchone())[0]
         pend = (await (await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")).fetchone())[0]
         paid = (await (await db.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='paid'")).fetchone())[0]
+    chs = await get_channels()
     await m.answer(
         f"🛠 <b>Админка</b>\n\n"
         f"Пользователей: {users}\n"
         f"Засчитанных рефералов: {refd}\n"
         f"Заявок в ожидании: {pend}\n"
-        f"Выплачено всего: {paid} ⭐\n\n"
-        f"Рассылка: <code>/broadcast текст</code>",
+        f"Выплачено всего: {paid} ⭐\n"
+        f"Каналов в ОП: {len(chs)}\n\n"
+        f"<b>Команды:</b>\n"
+        f"/addop @канал — добавить в ОП\n"
+        f"/delop @канал — убрать из ОП\n"
+        f"/listop — список каналов ОП\n"
+        f"/broadcast текст — рассылка",
         parse_mode="HTML",
     )
+
+
+@router.message(Command("addop"))
+async def addop(m: Message, command: CommandObject, bot: Bot):
+    if m.from_user.id != ADMIN_ID:
+        return
+    if not command.args:
+        await m.answer("Напиши так: /addop @channel")
+        return
+    ch = norm_channel(command.args)
+    try:
+        me = await bot.get_me()
+        st = (await bot.get_chat_member(ch, me.id)).status
+        if st != "administrator":
+            raise ValueError("not admin")
+    except Exception:
+        await m.answer(
+            f"Не получилось добавить {ch}.\n"
+            "Проверь: 1) канал публичный и ты написал @username правильно, "
+            "2) бот добавлен в канал АДМИНИСТРАТОРОМ."
+        )
+        return
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT OR IGNORE INTO channels VALUES(?)", (ch,))
+        await db.commit()
+    await m.answer(f"✅ {ch} добавлен в ОП")
+
+
+@router.message(Command("delop"))
+async def delop(m: Message, command: CommandObject):
+    if m.from_user.id != ADMIN_ID:
+        return
+    if not command.args:
+        await m.answer("Напиши так: /delop @channel")
+        return
+    ch = norm_channel(command.args)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM channels WHERE username=?", (ch,))
+        await db.commit()
+    await m.answer(f"🗑 {ch} убран из ОП")
+
+
+@router.message(Command("listop"))
+async def listop(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    chs = await get_channels()
+    await m.answer("Каналы ОП:\n" + ("\n".join(chs) if chs else "пусто"))
 
 
 @router.message(Command("broadcast"))
