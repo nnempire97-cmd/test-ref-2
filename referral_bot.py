@@ -27,7 +27,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL = os.getenv("CHANNEL", "@tour6767")  # "" = без проверки подписки
 REWARD = 3          # звёзд за приглашённого
 MIN_WITHDRAW = 15   # минимум для вывода
-DB = "bot.db"
+DB = os.getenv("DB_PATH", "bot.db")
 
 router = Router()
 log = logging.getLogger("refbot")
